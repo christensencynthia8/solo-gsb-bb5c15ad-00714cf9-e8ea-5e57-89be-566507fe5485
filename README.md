@@ -1,6 +1,6 @@
 # 播客章节标注工作台 (Podcast Chapter Studio)
 
-基于 **React + TypeScript + Web Audio API** 的网页播客章节标注工具：导入本地音频后，在可缩放波形上拖拽创建、移动、调整章节区间，自动吸附邻近边界并阻止重叠，支持键盘微调、章节搜索/排序、选中片段实时预览，并导出带章节标题的 **WebVTT** 和 **JSON** 文件。内置**静音切分建议**：按 100ms 窗口分析多声道 RMS，自动在静音中点给出候选切分边界，可一键应用。另内置**章节音量一致性质检**：按 200ms 窗口计算多声道合并 dBFS，以窗口与章节的实际重叠时长加权汇总每章平均音量与动态范围，可自定义过轻 / 过响阈值，异常区间在波形上着色、点击即可从该处预览，并随 JSON 一并导出。
+基于 **React + TypeScript + Web Audio API** 的网页播客章节标注工具：导入本地音频后，在可缩放波形上拖拽创建、移动、调整章节区间，自动吸附邻近边界并阻止重叠，支持键盘微调、章节搜索/排序、选中片段实时预览，并导出带章节标题的 **WebVTT** 和 **JSON** 文件。内置**静音切分建议**：按 100ms 窗口分析多声道 RMS，自动在静音中点给出候选切分边界，可一键应用。另内置**章节音量一致性质检**：按 200ms 窗口计算多声道合并 dBFS，以窗口与章节的实际重叠时长加权汇总每章平均音量与动态范围，可自定义过轻 / 过响阈值，异常区间在波形上着色、点击即可从该处预览，并随 JSON 一并导出。支持**章节淡入淡出试听**：每章可独立设置 0～5 秒的淡入 / 淡出时长与开关，预览时按实际播放区间构建增益包络，淡入从静音平滑升至原音量、淡出在章尾前降至静音。
 
 ## 一键启动（Docker）
 
@@ -17,7 +17,7 @@ docker compose up --build
 ```bash
 npm install
 npm run dev        # http://localhost:5173
-npm test           # 章节吸附/防重叠 + 静音切分 + 音量质检核心逻辑测试
+npm test           # 章节吸附/防重叠 + 静音切分 + 音量质检 + 淡入淡出包络核心逻辑测试
 npm run build      # 产出 dist/
 ```
 
@@ -38,6 +38,11 @@ npm run build      # 产出 dist/
   - 调整阈值只对缓存的窗口 dBFS 重新判定，**不会重新解码或重新扫描音频**。
 - **搜索 / 排序**：左侧面板按标题搜索，可按开始时间、标题或时长排序。
 - **预览**：列表项 ▶、「预览章节」按钮或快捷键 `P` 播放选中章节区间（到点自动停止）。
+- **淡入淡出试听**：选中章节后，在右侧详情区开启「预览该章时应用淡入淡出」，分别设置淡入 / 淡出时长（0～5 秒，步进 0.1s）。
+  - 预览该章（含「从异常处预览」）时按**实际播放区间**构建增益包络：淡入从静音线性升至原音量，保持后在章尾前线性降至静音，曲线连续、不越过章界。
+  - 淡入 + 淡出超过章节长度时，按两者之和**等比例压缩**到刚好铺满整章；面板实时显示压缩后的实际生效时长。
+  - 暂停、拖动播放头、重复预览或修改参数都会先停止旧音源并拆除旧包络再重建，不会叠加残留声音；关闭开关立即恢复原始（无淡入淡出）预览。
+  - 淡入淡出设置仅为预览用界面状态，不写入章节数据，WebVTT / JSON 导出格式不变。
 
 ### 快捷键
 
@@ -80,6 +85,7 @@ npm run build      # 产出 dist/
 - 静音分析复用已解码的 `AudioBuffer`（不重新解码）：100ms 窗口多声道合并 RMS 只在导入时计算一次；阈值 / 最短静音变化时仅重算静音段与候选边界（`src/audio/silence.ts` 纯函数，由 `scripts/test-silence.ts` 覆盖）。
 - 音量质检同样复用导入时已解码的 PCM：200ms 窗口的多声道合并 dBFS 只在导入时计算一次；阈值变化仅对缓存数组重新分类与合并异常区间。章节均值采用能量（重叠时长）加权平均 `10·log10(Σwᵢ10^(dbᵢ/10)/Σwᵢ)`，跨章节窗口按实际重叠拆分归属；静音映射为 `-Infinity`（绝不出 NaN），全静音 / 极短章节均有确定结果（`src/audio/loudness.ts` 纯函数，由 `scripts/test-loudness.ts` 覆盖）。
 - 吸附 / 防重叠逻辑集中在 `src/utils/chapterOps.ts` 纯函数中（`moveChapter` / `resizeChapter` / `createChapterInGap` / `findFreeGap`），由 `scripts/test-chapterOps.ts` 覆盖。
+- 淡入淡出包络为纯函数（`src/audio/fade.ts`：`fitFadeTimes` 等比例压缩、`buildFadeCurve` 生成曲线关键点），由 `scripts/test-fade.ts` 覆盖；播放时 `AudioEngine` 为每次预览挂一个独立的 `GainNode` 包络（source → envelope → 主增益），停止 / 重建时取消自动化并断开节点，杜绝残留声音。
 - 播放基于 Web Audio API：`AudioBufferSourceNode` 支持带结束点的片段预览，播放头由 rAF 驱动。
 - Docker 为多阶段构建：`node:20-alpine` 构建 → `nginx:1.27-alpine` 托管静态文件。
 
@@ -90,10 +96,10 @@ npm run build      # 产出 dist/
 ├── docker-compose.yml      # 单服务，8080:80
 ├── nginx.conf              # SPA 回退 + 静态资源缓存
 ├── src/
-│   ├── audio/              # AudioEngine（播放/片段预览）、peaks（波形峰值）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
-│   ├── components/         # Waveform / ChapterList / TransportBar / SilencePanel / LoudnessPanel
+│   ├── audio/              # AudioEngine（播放/片段预览/淡入淡出包络）、fade（包络曲线）、peaks（波形峰值）、silence（静音 RMS/候选边界）、loudness（200ms dBFS/章节质检）
+│   ├── components/         # Waveform / ChapterList / TransportBar / SilencePanel / LoudnessPanel / FadePanel
 │   ├── hooks/useChapters.ts
 │   ├── utils/chapterOps.ts # 吸附、防重叠、空档查找（纯函数）
 │   └── utils/export.ts     # WebVTT / JSON（含章节质检指标）导出
-└── scripts/                # test-chapterOps.ts、test-silence.ts、test-loudness.ts
+└── scripts/                # test-chapterOps.ts、test-silence.ts、test-loudness.ts、test-fade.ts
 ```

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AudioEngine } from './audio/AudioEngine';
+import { DEFAULT_FADE, type FadeSettings } from './audio/fade';
 import {
   LOUDNESS_WINDOW_SEC,
   computeDbfsWindows,
@@ -17,6 +18,7 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { FadePanel } from './components/FadePanel';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
@@ -57,8 +59,23 @@ export default function App() {
   });
   const [showLoudness, setShowLoudness] = useState(true);
 
+  // per-chapter fade preview settings — UI-only state, keyed by chapter id;
+  // never part of chapter data or exports
+  const [fades, setFades] = useState<Record<string, FadeSettings>>({});
+  /** what the current playback is: a chapter preview started at `from` */
+  const previewRef = useRef<{ chapterId: string; from: number } | null>(null);
+
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
+
+  // drop fade settings of removed chapters (and of the previous file)
+  useEffect(() => {
+    setFades((prev) => {
+      const ids = new Set(chapters.map((c) => c.id));
+      const entries = Object.entries(prev).filter(([id]) => ids.has(id));
+      return entries.length === Object.keys(prev).length ? prev : Object.fromEntries(entries);
+    });
+  }, [chapters]);
 
   // recompute candidates whenever params or chapters change
   const suggestions = useMemo(() => {
@@ -106,7 +123,10 @@ export default function App() {
 
   // playback clock
   useEffect(() => {
-    engine.onEnded = () => setPlaying(false);
+    engine.onEnded = () => {
+      previewRef.current = null;
+      setPlaying(false);
+    };
     let raf = 0;
     const tick = () => {
       if (engine.playing) {
@@ -127,6 +147,7 @@ export default function App() {
       try {
         const buffer = await engine.decode(file);
         resetChapters();
+        previewRef.current = null;
         setPeaks(computePeaks(buffer));
         // reuse the decoded buffer for silence analysis (no re-decode)
         setRmsWindows(computeRmsWindows(buffer));
@@ -161,6 +182,7 @@ export default function App() {
     (t: number) => {
       const wasPlaying = engine.playing;
       engine.stop();
+      previewRef.current = null;
       setPlayhead(t);
       if (wasPlaying) {
         engine.play(t);
@@ -174,6 +196,7 @@ export default function App() {
 
   const togglePlay = useCallback(() => {
     if (!engine.hasBuffer) return;
+    previewRef.current = null;
     if (engine.playing) {
       const t = engine.pause();
       setPlayhead(t);
@@ -184,24 +207,60 @@ export default function App() {
     }
   }, [engine, playhead, duration]);
 
+  /**
+   * Preview a chapter interval. When fades are enabled for the chapter, the
+   * gain envelope is fitted to the ACTUAL playback range [from, chapter.end].
+   * play() always stops the previous source first, so repeated previews
+   * rebuild the curve instead of layering sound.
+   */
   const previewChapter = useCallback(
-    (start: number, end: number) => {
+    (c: Chapter, from?: number) => {
       if (!engine.hasBuffer) return;
-      engine.play(start, end);
+      const start = from ?? c.start;
+      const fade = fades[c.id];
+      previewRef.current = { chapterId: c.id, from: start };
+      if (fade?.enabled) {
+        engine.play(start, c.end, { fadeIn: fade.fadeIn, fadeOut: fade.fadeOut });
+      } else {
+        engine.play(start, c.end);
+      }
       setPlayhead(start);
       setPlaying(true);
     },
-    [engine],
+    [engine, fades],
   );
 
   const previewSelection = useCallback(() => {
-    if (selected) previewChapter(selected.start, selected.end);
+    if (selected) previewChapter(selected);
   }, [selected, previewChapter]);
+
+  /** Change fade settings; a playing preview of that chapter is rebuilt. */
+  const updateFade = useCallback(
+    (id: string, patch: Partial<FadeSettings>) => {
+      const next = { ...DEFAULT_FADE, ...fades[id], ...patch };
+      setFades((prev) => ({ ...prev, [id]: { ...DEFAULT_FADE, ...prev[id], ...patch } }));
+      // Param change while this chapter is being previewed: stop the old
+      // source and rebuild the curve immediately (never layered on top).
+      const p = previewRef.current;
+      if (p && p.chapterId === id && engine.playing) {
+        const c = chapters.find((x) => x.id === id);
+        if (c) {
+          if (next.enabled) {
+            engine.play(p.from, c.end, { fadeIn: next.fadeIn, fadeOut: next.fadeOut });
+          } else {
+            engine.play(p.from, c.end);
+          }
+        }
+      }
+    },
+    [engine, fades, chapters],
+  );
 
   /** Preview starting at a point (clicking an abnormal band). */
   const previewFrom = useCallback(
     (t: number) => {
       if (!engine.hasBuffer) return;
+      previewRef.current = null;
       engine.play(t);
       setPlayhead(t);
       setPlaying(true);
@@ -214,7 +273,7 @@ export default function App() {
     (c: Chapter) => {
       if (!engine.hasBuffer) return;
       const q = chapterLoudness?.get(c.id);
-      previewChapter(q?.firstIssueAt ?? c.start, c.end);
+      previewChapter(c, q?.firstIssueAt ?? c.start);
     },
     [engine, chapterLoudness, previewChapter],
   );
@@ -350,10 +409,13 @@ export default function App() {
                 const c = chapters.find((x) => x.id === id);
                 if (c) seek(c.start);
               }}
-              onPreview={(c) => previewChapter(c.start, c.end)}
+              onPreview={previewChapter}
               onPreviewIssue={previewChapterIssue}
               onRename={chaptersApi.rename}
-              onRemove={chaptersApi.remove}
+              onRemove={(id) => {
+                if (previewRef.current?.chapterId === id) previewRef.current = null;
+                chaptersApi.remove(id);
+              }}
             />
             <aside className="detail-panel">
               <SilencePanel
@@ -390,6 +452,11 @@ export default function App() {
                     <span>结束 {formatTime(selected.end)}</span>
                     <span>时长 {(selected.end - selected.start).toFixed(2)}s</span>
                   </div>
+                  <FadePanel
+                    fade={fades[selected.id] ?? DEFAULT_FADE}
+                    chapterDuration={selected.end - selected.start}
+                    onChange={(patch) => updateFade(selected.id, patch)}
+                  />
                   {(() => {
                     const q = chapterLoudness?.get(selected.id);
                     if (!q) return null;

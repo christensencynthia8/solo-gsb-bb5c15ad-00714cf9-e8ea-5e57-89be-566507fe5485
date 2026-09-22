@@ -1,12 +1,17 @@
+import { buildFadeCurve, type FadeSpec } from './fade';
+
 /**
  * Thin wrapper around Web Audio API for buffer playback.
- * Supports full-file playback and segment (chapter) preview.
+ * Supports full-file playback and segment (chapter) preview, optionally
+ * with a fade-in/fade-out gain envelope fitted to the played segment.
  */
 export class AudioEngine {
   private ctx: AudioContext | null = null;
   private buffer: AudioBuffer | null = null;
   private source: AudioBufferSourceNode | null = null;
   private gain: GainNode | null = null;
+  /** per-preview fade envelope node (source -> env -> gain) */
+  private env: GainNode | null = null;
   /** ctx.currentTime at which playback started */
   private startedAt = 0;
   /** buffer offset at which playback started */
@@ -51,35 +56,54 @@ export class AudioEngine {
     return Math.min(t, this.duration);
   }
 
-  play(from: number, to?: number): void {
+  play(from: number, to?: number, fade?: FadeSpec): void {
     if (!this.buffer) return;
     const ctx = this.ensureCtx();
     this.stopSource();
     const source = ctx.createBufferSource();
     source.buffer = this.buffer;
-    source.connect(this.gain!);
     const dur = this.buffer.duration;
     const start = Math.max(0, Math.min(from, dur));
     this.offset = start;
-    this.startedAt = ctx.currentTime;
     this.stopAt = to !== undefined ? Math.min(to, dur) : null;
+    const segLen = Math.max(0, (this.stopAt ?? dur) - start);
+    const t0 = ctx.currentTime;
+
+    // Fade envelope: a dedicated GainNode per preview, fitted to the actual
+    // playback segment. Rebuilding never touches the master gain, and the
+    // old node is fully torn down in stopSource() — no overlapping sound.
+    const curve = fade ? buildFadeCurve(fade.fadeIn, fade.fadeOut, segLen) : null;
+    if (curve && curve.length > 1) {
+      const env = ctx.createGain();
+      env.gain.setValueAtTime(curve[0].gain, t0 + curve[0].t);
+      for (let i = 1; i < curve.length; i++) {
+        env.gain.linearRampToValueAtTime(curve[i].gain, t0 + curve[i].t);
+      }
+      source.connect(env);
+      env.connect(this.gain!);
+      this.env = env;
+    } else {
+      source.connect(this.gain!);
+    }
 
     source.onended = () => {
-      // onended also fires on manual stop(); guard with playing flag
-      if (this.playing) {
-        this.playing = false;
-        this.offset = this.stopAt ?? this.offset;
-        this.clearTimer();
-        this.onEnded?.();
-      }
+      // onended also fires on manual stop(); only the CURRENT source may
+      // change state — a superseded source's event must be ignored.
+      if (this.source !== source || !this.playing) return;
+      this.playing = false;
+      this.offset = this.stopAt ?? this.offset;
+      this.clearTimer();
+      this.clearEnvelope();
+      this.onEnded?.();
     };
 
     if (this.stopAt !== null && this.stopAt > start) {
-      source.start(0, start, this.stopAt - start);
+      source.start(t0, start, this.stopAt - start);
     } else {
-      source.start(0, start);
+      source.start(t0, start);
     }
     this.source = source;
+    this.startedAt = t0;
     this.playing = true;
   }
 
@@ -97,6 +121,7 @@ export class AudioEngine {
   }
 
   private stopSource(): void {
+    this.clearEnvelope();
     if (this.source) {
       const s = this.source;
       this.source = null;
@@ -107,6 +132,20 @@ export class AudioEngine {
         /* already stopped */
       }
       s.disconnect();
+    }
+  }
+
+  /** Cancel pending fade automation and detach the envelope node. */
+  private clearEnvelope(): void {
+    if (this.env) {
+      const e = this.env;
+      this.env = null;
+      try {
+        e.gain.cancelScheduledValues(0);
+      } catch {
+        /* ignore */
+      }
+      e.disconnect();
     }
   }
 
