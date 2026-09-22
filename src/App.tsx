@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { AudioEngine } from './audio/AudioEngine';
+import { AudioEngine, type PlayEnvelope } from './audio/AudioEngine';
+import {
+  DEFAULT_FADE,
+  resolveChapterFade,
+  type ChapterFade,
+} from './audio/fade';
 import {
   LOUDNESS_WINDOW_SEC,
   computeDbfsWindows,
@@ -17,6 +22,7 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { FadePanel } from './components/FadePanel';
 import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
@@ -56,6 +62,11 @@ export default function App() {
     loudDb: -6,
   });
   const [showLoudness, setShowLoudness] = useState(true);
+
+  // preview-only fade settings per chapter id (never exported, never on Chapter)
+  const [fades, setFades] = useState<Record<string, ChapterFade>>({});
+  /** id of the chapter whose segment preview is currently running */
+  const previewingIdRef = useRef<string | null>(null);
 
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
@@ -106,7 +117,10 @@ export default function App() {
 
   // playback clock
   useEffect(() => {
-    engine.onEnded = () => setPlaying(false);
+    engine.onEnded = () => {
+      previewingIdRef.current = null;
+      setPlaying(false);
+    };
     let raf = 0;
     const tick = () => {
       if (engine.playing) {
@@ -117,6 +131,19 @@ export default function App() {
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   }, [engine]);
+
+  // drop fade settings for chapters that no longer exist
+  useEffect(() => {
+    setFades((prev) => {
+      let changed = false;
+      const next: Record<string, ChapterFade> = {};
+      for (const [id, fade] of Object.entries(prev)) {
+        if (chapters.some((c) => c.id === id)) next[id] = fade;
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [chapters]);
 
   useEffect(() => () => engine.dispose(), [engine]);
 
@@ -136,6 +163,8 @@ export default function App() {
         setFileName(file.name);
         setPlayhead(0);
         setPlaying(false);
+        setFades({});
+        previewingIdRef.current = null;
       } catch {
         setError('无法解码该音频文件，请换用常见格式（MP3 / WAV / M4A / OGG）。');
       } finally {
@@ -161,6 +190,7 @@ export default function App() {
     (t: number) => {
       const wasPlaying = engine.playing;
       engine.stop();
+      previewingIdRef.current = null;
       setPlayhead(t);
       if (wasPlaying) {
         engine.play(t);
@@ -176,33 +206,49 @@ export default function App() {
     if (!engine.hasBuffer) return;
     if (engine.playing) {
       const t = engine.pause();
+      previewingIdRef.current = null;
       setPlayhead(t);
       setPlaying(false);
     } else {
       engine.play(playhead >= duration - 0.05 ? 0 : playhead);
+      previewingIdRef.current = null;
       setPlaying(true);
     }
   }, [engine, playhead, duration]);
 
-  const previewChapter = useCallback(
-    (start: number, end: number) => {
+  /**
+   * Preview a chapter segment. The fade envelope is built from the *actual*
+   * playback interval (`to - from`), so previews starting at an abnormal spot
+   * get a correctly shortened fade-in and a fade-out right before the chapter
+   * end. Every call goes through AudioEngine.play(), which tears down the
+   * previous source first — repeated previews never stack sound.
+   */
+  const playChapterPreview = useCallback(
+    (id: string | null, from: number, to: number) => {
       if (!engine.hasBuffer) return;
-      engine.play(start, end);
-      setPlayhead(start);
+      const segmentSec = to - from;
+      const resolved = id !== null ? resolveChapterFade(segmentSec, fades[id]) : null;
+      const envelope: PlayEnvelope | undefined = resolved
+        ? { fadeInSec: resolved.fadeInSec, fadeOutSec: resolved.fadeOutSec }
+        : undefined;
+      engine.play(from, to, envelope);
+      previewingIdRef.current = id;
+      setPlayhead(from);
       setPlaying(true);
     },
-    [engine],
+    [engine, fades],
   );
 
   const previewSelection = useCallback(() => {
-    if (selected) previewChapter(selected.start, selected.end);
-  }, [selected, previewChapter]);
+    if (selected) playChapterPreview(selected.id, selected.start, selected.end);
+  }, [selected, playChapterPreview]);
 
-  /** Preview starting at a point (clicking an abnormal band). */
+  /** Preview starting at a point (clicking an abnormal band); no chapter boundary. */
   const previewFrom = useCallback(
     (t: number) => {
       if (!engine.hasBuffer) return;
       engine.play(t);
+      previewingIdRef.current = null;
       setPlayhead(t);
       setPlaying(true);
     },
@@ -214,14 +260,67 @@ export default function App() {
     (c: Chapter) => {
       if (!engine.hasBuffer) return;
       const q = chapterLoudness?.get(c.id);
-      previewChapter(q?.firstIssueAt ?? c.start, c.end);
+      playChapterPreview(c.id, q?.firstIssueAt ?? c.start, c.end);
     },
-    [engine, chapterLoudness, previewChapter],
+    [engine, chapterLoudness, playChapterPreview],
+  );
+
+  /**
+   * Change the selected chapter's fade settings. While that chapter is being
+   * previewed, the old source is stopped and the curve rebuilt immediately
+   * (from the current playhead to the chapter end), so no stale sound remains.
+   * Turning the switch off restores the plain preview.
+   */
+  const updateFade = useCallback(
+    (id: string, patch: Partial<ChapterFade>) => {
+      setFades((prev) => {
+        const base = prev[id] ?? DEFAULT_FADE;
+        const next: ChapterFade = {
+          enabled: patch.enabled ?? base.enabled,
+          fadeInSec:
+            patch.fadeInSec === undefined
+              ? base.fadeInSec
+              : Math.min(5, Math.max(0, patch.fadeInSec)),
+          fadeOutSec:
+            patch.fadeOutSec === undefined
+              ? base.fadeOutSec
+              : Math.min(5, Math.max(0, patch.fadeOutSec)),
+        };
+        return { ...prev, [id]: next };
+      });
+      const c = chapters.find((x) => x.id === id);
+      if (!c || previewingIdRef.current !== id || !engine.playing) return;
+      const at = engine.getTime();
+      if (at < c.end) {
+        // rebuild from the current position within the segment
+        const patchNext = { ...(fades[id] ?? DEFAULT_FADE), ...patch };
+        const resolved = resolveChapterFade(c.end - at, patchNext);
+        engine.play(at, c.end, resolved ?? undefined);
+        setPlaying(true);
+      } else {
+        engine.stop();
+        previewingIdRef.current = null;
+        setPlaying(false);
+      }
+    },
+    [chapters, engine, fades],
   );
 
   const addAtPlayhead = useCallback(() => {
     chaptersApi.createAtPlayhead(playhead);
   }, [chaptersApi, playhead]);
+
+  const removeChapter = useCallback(
+    (id: string) => {
+      if (previewingIdRef.current === id) {
+        engine.stop();
+        previewingIdRef.current = null;
+        setPlaying(false);
+      }
+      chaptersApi.remove(id);
+    },
+    [engine, chaptersApi],
+  );
 
   // ---- keyboard shortcuts ----
   useEffect(() => {
@@ -257,7 +356,7 @@ export default function App() {
       } else if (e.key === 'p' || e.key === 'P') {
         previewSelection();
       } else if ((e.key === 'Delete' || e.key === 'Backspace') && sel) {
-        chaptersApi.remove(sel.id);
+        removeChapter(sel.id);
       } else if (e.key === 'Escape') {
         chaptersApi.select(null);
       } else {
@@ -267,7 +366,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [peaks, chaptersApi, togglePlay, previewSelection, addAtPlayhead]);
+  }, [peaks, chaptersApi, togglePlay, previewSelection, addAtPlayhead, removeChapter]);
 
   const baseName = (fileName ?? 'podcast').replace(/\.[^.]+$/, '');
 
@@ -350,10 +449,10 @@ export default function App() {
                 const c = chapters.find((x) => x.id === id);
                 if (c) seek(c.start);
               }}
-              onPreview={(c) => previewChapter(c.start, c.end)}
+              onPreview={(c) => playChapterPreview(c.id, c.start, c.end)}
               onPreviewIssue={previewChapterIssue}
               onRename={chaptersApi.rename}
-              onRemove={chaptersApi.remove}
+              onRemove={removeChapter}
             />
             <aside className="detail-panel">
               <SilencePanel
@@ -390,6 +489,11 @@ export default function App() {
                     <span>结束 {formatTime(selected.end)}</span>
                     <span>时长 {(selected.end - selected.start).toFixed(2)}s</span>
                   </div>
+                  <FadePanel
+                    segmentSec={selected.end - selected.start}
+                    fade={fades[selected.id] ?? DEFAULT_FADE}
+                    onChange={(patch) => updateFade(selected.id, patch)}
+                  />
                   {(() => {
                     const q = chapterLoudness?.get(selected.id);
                     if (!q) return null;
